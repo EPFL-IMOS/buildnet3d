@@ -38,8 +38,6 @@ NeuSTrackConfig = TrainerConfig(
             dataparser=BuildNetDataParserConfig(),
             train_num_rays_per_batch=2048,
             eval_num_rays_per_batch=2048,
-            # camera_optimizer=CameraOptimizerConfig(
-            #     mode="off"),
         ),
         model=NeuSModelConfig(
             sdf_field=SDFFieldConfig(
@@ -55,6 +53,11 @@ NeuSTrackConfig = TrainerConfig(
         ),
     ),
     optimizers={
+        "camera_opt": {
+            "mode": "off",
+            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=10000),
+        },
         "fields": {
             "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
             "scheduler": CosineDecaySchedulerConfig(
@@ -88,7 +91,6 @@ NeRFactoTrackConfig = TrainerConfig(
         model=NerfactoModelConfig(
             eval_num_rays_per_chunk=1 << 15,
             average_init_density=0.01,
-            camera_optimizer=CameraOptimizerConfig(mode="off"),
         ),
     ),
     optimizers={
@@ -116,7 +118,7 @@ SemanticSDFTrackConfig = TrainerConfig(
     steps_per_save=10000,
     steps_per_eval_all_images=1000000,
     max_num_iterations=300001,
-    save_only_latest_checkpoint= False,
+    save_only_latest_checkpoint= True,
     mixed_precision=False,
     pipeline=VanillaPipelineConfig(
         datamanager=VanillaDataManagerConfig(
@@ -124,20 +126,17 @@ SemanticSDFTrackConfig = TrainerConfig(
             dataparser=BuildNetDataParserConfig(),
             train_num_rays_per_batch=2048,
             eval_num_rays_per_batch=2048,
-            camera_optimizer=CameraOptimizerConfig(
-                mode="off",
-            ),
         ),
         model=SemanticSDFModelConfig(
-            near_plane=5.0,
-            far_plane=60.0,
+            near_plane=0.5,
+            far_plane=50.0,
             overwrite_near_far_plane=False,
             sdf_field=SemanticSDFFieldConfig(
                 num_layers=8,
                 num_layers_color=4,
                 hidden_dim=256,
-                bias=1.2,
-                beta_init=0.5,
+                bias=0.5,
+                beta_init=0.2,
                 inside_outside=False,
             ),
             background_model="none",
@@ -158,6 +157,11 @@ SemanticSDFTrackConfig = TrainerConfig(
             "scheduler": CosineDecaySchedulerConfig(
                 warm_up_end=5000, learning_rate_alpha=0.05, max_steps=300001
             ),
+        "camera_opt": {
+            "mode": "off",
+            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-4, max_steps=10000),
+        },
         },
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),

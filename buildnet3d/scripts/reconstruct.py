@@ -31,7 +31,6 @@ class TrainingConfig:
     use_appearance_embedding: Optional[bool] = False
     use_average_appearance_embedding: Optional[bool] = True
     use_grid_feature: Optional[bool] = True
-    use_transient_embedding: Optional[bool] = False
     
     def __post_init__(self) -> None:
         method_config = {
