@@ -8,6 +8,7 @@ sys.path.append(".")
 from nerfstudio.scripts.train import main
 from buildnet3d.models.method_configs import (
     NeRFactoTrackConfig,
+    SplatfactoTrackConfig,
     NeuSTrackConfig,
     SemanticSDFTrackConfig
 )
@@ -28,15 +29,12 @@ class TrainingConfig:
     load_config: Optional[Path] = None
     load_dir: Optional[Path] = None
     
-    use_appearance_embedding: Optional[bool] = False
-    use_average_appearance_embedding: Optional[bool] = True
-    use_grid_feature: Optional[bool] = True
-    
     def __post_init__(self) -> None:
         method_config = {
             "nerfacto": NeRFactoTrackConfig,
             "neus": NeuSTrackConfig,
             "semantic-sdf": SemanticSDFTrackConfig,
+            "splatfacto": SplatfactoTrackConfig
         }
         if self.model_type not in method_config:
             raise ValueError(f"Model type {self.model_type} not supported.")
@@ -47,12 +45,6 @@ class TrainingConfig:
         self.model.data = self.data
         self.model.load_config = self.load_config
         self.model.load_dir = self.load_dir
-        
-        if self.model_type in ['neus', "semantic-sdf"]:
-            self.model.pipeline.model.sdf_field.use_appearance_embedding = self.use_appearance_embedding
-            self.model.pipeline.model.sdf_field.use_grid_feature = self.use_grid_feature
-            self.model.pipeline.model.use_average_appearance_embedding = self.use_average_appearance_embedding
-
 
 if __name__ == "__main__":
     config = tyro.cli(TrainingConfig)
