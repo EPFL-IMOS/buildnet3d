@@ -1,24 +1,24 @@
 import blenderproc as bproc
-import bpy
-import bmesh
-import csv
+
 import json
 import sys
 from dataclasses import dataclass
-from math import floor, ceil
+from math import ceil, floor
 from pathlib import Path
 from typing import Optional
 
+import bmesh
+import bpy
 import h5py
-import numpy as np
-from PIL import Image
-import tyro
 import matplotlib
+import numpy as np
+import tyro
+from PIL import Image
 from scipy.spatial import cKDTree
 
 sys.path.extend(["/home/chexu/buildnet3d"])
-from buildnet3d.utils.utils import build_translation, load_temperatures_from_csv
 from blenderproc.python.types.MeshObjectUtility import convert_to_meshes
+from buildnet3d.utils.utils import build_translation, load_temperatures_from_csv
 
 
 @dataclass
@@ -43,7 +43,7 @@ class RenderParams:
     """Path to point-cloud temperature CSV with columns x,y,z,temperature"""
     render_thermal: bool = True
     """Render thermal image from point cloud"""
-    thermal_point_size: int = 3
+    thermal_point_size: int = 2
     """Projected thermal point splat size in pixels"""
     thermal_cmap: str = "inferno"
     """Matplotlib colormap for thermal visualization"""
@@ -55,7 +55,7 @@ class RenderParams:
     """Visibility tolerance when comparing thermal depth against mesh depth"""
     thermal_background: tuple[int, int, int] = (0, 0, 0)
     """RGB background color for thermal images"""
-    thermal_k_neighbors: int = 5
+    thermal_k_neighbors: int = 2
     """Number of nearest thermal points used for mesh vertex temperature interpolation"""
 
     # Coordinate convention for thermal CSV
@@ -65,7 +65,7 @@ class RenderParams:
     """Scale thermal cloud bbox to STL mesh bbox"""
 
     # Camera parameters
-    load_camera_path: Optional[Path] = None
+    load_camera_path: Optional[Path] = Path("bproc_generator/data/example/cameras.json")
     """Optional path to predefined camera trajectory"""
     bound_thresh: int = 2
     """Pixel threshold for boundary object detection"""
@@ -81,9 +81,9 @@ class RenderParams:
     """Elevation angle range (radians)"""
     gamma_range: tuple[float, float] = (0.0, 0.0)
     """In-plane rotation range (radians)"""
-    dist_thresh: float = 2.0
+    dist_thresh: float = 0.005
     """Minimum distance between camera poses to avoid overlap"""
-    
+
     # Camera adjustment
     delta_radius: tuple[float, float] = (0.001, 0.005)
     """Radius adjustment range during pose refinement"""
@@ -100,6 +100,20 @@ class RenderParams:
     hdr_strength: float = 1.0
     hdr_rotation: tuple[float, float, float] = (0.0, 0.0, 0.3926)
 
+@dataclass
+class ThermalViewCache:
+    """Geometry-dependent cache for one fixed view."""
+
+    point_px: Optional[np.ndarray] = None
+    point_py: Optional[np.ndarray] = None
+    point_depth: Optional[np.ndarray] = None
+    point_linear_idx: Optional[np.ndarray] = None
+
+    mesh_px: Optional[np.ndarray] = None
+    mesh_py: Optional[np.ndarray] = None
+    mesh_vertex_ids: Optional[np.ndarray] = None
+    mesh_bary: Optional[np.ndarray] = None
+
 
 @dataclass
 class BlenderProcRenderer(RenderParams):
@@ -114,7 +128,7 @@ class BlenderProcRenderer(RenderParams):
             "has_mono_prior": False,
             "has_foreground_mask": False,
             "has_sparse_sfm_points": False,
-            "scene_box": {},
+            "scene_box": {"aabb": [[], []]},
             "frames": [],
         }
 
@@ -132,19 +146,29 @@ class BlenderProcRenderer(RenderParams):
         self.color_map = self._get_color_map()
         self.camera_idx = 0
 
+        mesh_min, mesh_max = self._compute_scene_bbox()
+        mesh_size = mesh_max - mesh_min
+        self.metadata["scene_box"]["aabb"][0] = (mesh_min - 0.25 * mesh_size).tolist()
+        self.metadata["scene_box"]["aabb"][1] = (mesh_max + 0.25 * mesh_size).tolist()
+
+        # Thermal point cloud data
         self.thermal_points_world: Optional[np.ndarray] = None
         self.thermal_values: Optional[np.ndarray] = None
         self.thermal_timestamps: Optional[np.ndarray] = None
         self.thermal_node_ids: Optional[np.ndarray] = None
 
+        # Geometry for thermal rendering
         self.mesh_vertices_world: Optional[np.ndarray] = None
         self.mesh_faces: Optional[np.ndarray] = None
-        self.mesh_vertex_temperatures: Optional[np.ndarray] = None
+        self.mesh_interp_indices: Optional[np.ndarray] = None
+        self.mesh_interp_weights: Optional[np.ndarray] = None
+
+        self.thermal_render_cache: dict[int, ThermalViewCache] = {}
 
         if self.render_thermal and self.thermal_csv is not None:
             self._load_thermal_cloud()
             self.mesh_vertices_world, self.mesh_faces = self._extract_scene_mesh_world()
-
+            self.mesh_interp_indices, self.mesh_interp_weights = self._build_mesh_temperature_interpolator()
 
     def _load_stl_as_mesh_objects(self, stl_path: Path):
         """Import STL with bpy, then wrap imported Blender objects as BlenderProc MeshObjects."""
@@ -154,7 +178,7 @@ class BlenderProcRenderer(RenderParams):
             filepath=str(stl_path),
             global_scale=1.0,
             use_scene_unit=False,
-            use_facet_normal=False,
+            use_facet_normal=True,
             forward_axis="Y",
             up_axis="Z",
         )
@@ -238,8 +262,7 @@ class BlenderProcRenderer(RenderParams):
 
         self.thermal_min = self.thermal_min if self.thermal_min is not None else float(temps.min())
         self.thermal_max = self.thermal_max if self.thermal_max is not None else float(temps.max())
-        print(f"Loaded thermal cloud: {len(points)} points")
-        print(f"Temperature range: [{self.thermal_min:.4f}, {self.thermal_max:.4f}]")
+        self.metadata["temperature_range"] = [self.thermal_min, self.thermal_max]
 
     def _extract_scene_mesh_world(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -278,31 +301,45 @@ class BlenderProcRenderer(RenderParams):
         faces = np.concatenate(all_faces, axis=0)
         return vertices_world, faces
 
-    @staticmethod
-    def _transfer_temperature_to_mesh_vertices(
-        mesh_vertices_world: np.ndarray,
-        thermal_points_world: np.ndarray,
-        thermal_values: np.ndarray,
-        k: int = 3,
-    ) -> np.ndarray:
+    def _build_mesh_temperature_interpolator(self) -> tuple[np.ndarray, np.ndarray]:
         """
-        Assign temperature to each mesh vertex from the thermal point cloud.
-        Uses inverse-distance weighted interpolation from nearest thermal points.
+        Precompute inverse-distance interpolation from thermal points to mesh vertices.
+        Returns:
+            idxs:    (N_vertices, k) nearest thermal point indices
+            weights: (N_vertices, k) normalized interpolation weights
         """
-        tree = cKDTree(thermal_points_world)
-        dists, idxs = tree.query(mesh_vertices_world, k=k)
+        if self.mesh_vertices_world is None or self.thermal_points_world is None:
+            raise RuntimeError("Mesh vertices or thermal points are not available.")
+
+        k = max(1, self.thermal_k_neighbors)
+        tree = cKDTree(self.thermal_points_world)
+        dists, idxs = tree.query(self.mesh_vertices_world, k=k)
 
         if k == 1:
-            return thermal_values[idxs]
+            idxs = idxs[:, None]
+            weights = np.ones((len(self.mesh_vertices_world), 1), dtype=np.float64)
+            return idxs, weights
 
         dists = np.maximum(dists, 1e-8)
         weights = 1.0 / dists
-        weights = weights / np.sum(weights, axis=1, keepdims=True)
+        weights /= np.sum(weights, axis=1, keepdims=True)
+        return idxs, weights
 
-        temps = np.sum(thermal_values[idxs] * weights, axis=1)
-        return temps
+    def _compute_mesh_vertex_temperatures(self, point_temperatures: np.ndarray) -> np.ndarray:
+        """Interpolate one thermal frame from points to mesh vertices."""
+        if self.mesh_interp_indices is None or self.mesh_interp_weights is None:
+            raise RuntimeError("Mesh interpolation cache is not initialized.")
+
+        return np.sum(
+            self.mesh_interp_weights * point_temperatures[self.mesh_interp_indices],
+            axis=1,
+        )
 
     def _check_boundary(self, camera_pose: np.ndarray) -> tuple[list[bool], dict[str, list[bool]]]:
+        # NOTE:
+        # BlenderProc does not expose a super-clean "probe pose without registering" API here.
+        # This keeps the current behavior, but uses the same index each retry.
+        # If BlenderProc appends instead of overwriting, this is the one place to verify experimentally.
         bproc.camera.add_camera_pose(camera_pose, self.camera_idx)
         depth = bproc.camera.depth_via_raytracing(self.bvh_tree)
 
@@ -360,7 +397,9 @@ class BlenderProcRenderer(RenderParams):
                 radius += np.random.uniform(*self.delta_radius)
             if not content_valid:
                 radius -= np.random.uniform(*self.delta_radius)
+
             print(f"Boundaries: {boundaries}, Valid: {bound_valid}, Content Valid: {content_valid}", end="\r")
+
             if not boundaries["top"][0] or not boundaries["bottom"][1]:
                 poi[2] += np.random.uniform(*self.delta_poi)
                 phi += np.random.uniform(*self.delta_phi)
@@ -379,8 +418,6 @@ class BlenderProcRenderer(RenderParams):
 
             retries += 1
             if retries >= self.retry_count:
-                self._add_camera_pose(camera_pose)
-                return
                 theta, phi, gamma, poi = random_camera_params()
                 radius = self.radius
                 retries = 0
@@ -438,34 +475,30 @@ class BlenderProcRenderer(RenderParams):
         w3 = 1.0 - w1 - w2
         return w1, w2, w3
 
-    def _render_thermal_image(
+    def _build_thermal_render_cache(
         self,
-        points_world: np.ndarray,
-        temperatures: np.ndarray,
-        cam2world: np.ndarray,
         K: np.ndarray,
+        cam2world: np.ndarray,
         depth_map: np.ndarray,
-    ) -> np.ndarray:
+    ) -> ThermalViewCache:
         """
-        Dense thermal rendering:
-        1) sparse point splat from thermal point cloud,
-        2) fill black non-background pixels using STL triangles and interpolated mesh-vertex temperatures.
-
-        Blender camera convention:
-        - camera looks along -Z,
-        - visible points have Z_cam < 0.
+        Precompute all geometry-dependent quantities for a fixed camera view.
+        This cache can be reused for every thermal timestep.
         """
         H, W = depth_map.shape
-        image = np.zeros((H, W, 3), dtype=np.uint8)
-        image[:] = np.asarray(self.thermal_background, dtype=np.uint8)
-
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
 
+        cache = ThermalViewCache()
+
+        # CHANGED: explicit guard to keep type/None behavior sane
+        if self.thermal_points_world is None:
+            return cache
+
         # ---------------------------------------------------
-        # Stage 1: sparse point-cloud rendering
+        # Cache sparse thermal point projection / visibility
         # ---------------------------------------------------
-        points_cam = self._world_to_camera(points_world, cam2world)
+        points_cam = self._world_to_camera(self.thermal_points_world, cam2world)
         X = points_cam[:, 0]
         Y = points_cam[:, 1]
         Z = points_cam[:, 2]
@@ -474,14 +507,12 @@ class BlenderProcRenderer(RenderParams):
         X = X[valid]
         Y = Y[valid]
         Z = Z[valid]
-        temps = temperatures[valid]
+        valid_point_indices = np.nonzero(valid)[0]
 
         if len(X) > 0:
             depth_pts = -Z
             u = fx * X / depth_pts + cx
             v = fy * (-Y) / depth_pts + cy
-
-            colors = self._temperature_to_rgb(temps)
 
             uu = np.round(u).astype(np.int32)
             vv = np.round(v).astype(np.int32)
@@ -490,59 +521,41 @@ class BlenderProcRenderer(RenderParams):
             uu = uu[inside]
             vv = vv[inside]
             depth_pts = depth_pts[inside]
-            colors = colors[inside]
+            valid_point_indices = valid_point_indices[inside]
 
-            z_buffer = np.full((H, W), np.inf, dtype=np.float64)
-            radius = max(0, self.thermal_point_size // 2)
+            mesh_depth_at_points = depth_map[vv, uu]
+            visible = np.isfinite(mesh_depth_at_points) & (
+                depth_pts <= mesh_depth_at_points + self.thermal_depth_epsilon
+            )
 
-            for px, py, pz, color in zip(uu, vv, depth_pts, colors):
-                mesh_depth = depth_map[py, px]
-                if not np.isfinite(mesh_depth):
-                    continue
-                if pz > mesh_depth + self.thermal_depth_epsilon:
-                    continue
-
-                for dx in range(-radius, radius + 1):
-                    for dy in range(-radius, radius + 1):
-                        xx = px + dx
-                        yy = py + dy
-                        if 0 <= xx < W and 0 <= yy < H:
-                            md = depth_map[yy, xx]
-                            if not np.isfinite(md):
-                                continue
-                            if pz > md + self.thermal_depth_epsilon:
-                                continue
-                            if pz < z_buffer[yy, xx]:
-                                z_buffer[yy, xx] = pz
-                                image[yy, xx] = color
+            cache.point_px = uu[visible]
+            cache.point_py = vv[visible]
+            cache.point_depth = depth_pts[visible]
+            cache.point_linear_idx = valid_point_indices[visible]
 
         # ---------------------------------------------------
-        # Stage 2: fill black non-background pixels using mesh triangles
+        # Cache dense mesh fill pixels and barycentric weights
         # ---------------------------------------------------
-        if (
-            self.mesh_vertices_world is None
-            or self.mesh_faces is None
-            or self.mesh_vertex_temperatures is None
-        ):
-            return image
+        if self.mesh_vertices_world is None or self.mesh_faces is None:
+            return cache
 
         mesh_cam = self._world_to_camera(self.mesh_vertices_world, cam2world)
         VX = mesh_cam[:, 0]
         VY = mesh_cam[:, 1]
         VZ = mesh_cam[:, 2]
 
-        valid_verts = VZ < -1e-8
-        if not np.any(valid_verts):
-            return image
+        if not np.any(VZ < -1e-8):
+            return cache
 
         mesh_depth = -VZ
         proj_u = fx * VX / mesh_depth + cx
         proj_v = fy * (-VY) / mesh_depth + cy
         verts_2d = np.stack([proj_u, proj_v], axis=1)
 
-        temp_min = self.thermal_min
-        temp_max = self.thermal_max
-        cmap = matplotlib.colormaps.get_cmap(self.thermal_cmap)
+        fill_px = []
+        fill_py = []
+        fill_vids = []
+        fill_bary = []
 
         for f in self.mesh_faces:
             i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
@@ -554,10 +567,6 @@ class BlenderProcRenderer(RenderParams):
             p0 = verts_2d[i0]
             p1 = verts_2d[i1]
             p2 = verts_2d[i2]
-
-            t0 = self.mesh_vertex_temperatures[i0]
-            t1 = self.mesh_vertex_temperatures[i1]
-            t2 = self.mesh_vertex_temperatures[i2]
 
             d0 = -z0
             d1 = -z1
@@ -573,15 +582,15 @@ class BlenderProcRenderer(RenderParams):
 
             for py in range(min_y, max_y + 1):
                 for px in range(min_x, max_x + 1):
-                    # only fill black pixels that are not background
                     if not np.isfinite(depth_map[py, px]):
-                        continue
-                    if np.any(image[py, px] != 0):
                         continue
 
                     w0, w1, w2 = self._barycentric_coords_2d(
-                        px + 0.5, py + 0.5,
-                        p0, p1, p2
+                        px + 0.5,
+                        py + 0.5,
+                        p0,
+                        p1,
+                        p2,
                     )
                     if w0 < 0.0 or w1 < 0.0 or w2 < 0.0:
                         continue
@@ -590,11 +599,96 @@ class BlenderProcRenderer(RenderParams):
                     if abs(tri_depth - depth_map[py, px]) > self.thermal_depth_epsilon:
                         continue
 
-                    tri_temp = w0 * t0 + w1 * t1 + w2 * t2
-                    tri_temp_norm = np.clip((tri_temp - temp_min) / (temp_max - temp_min + 1e-12), 0.0, 1.0)
-                    color = (np.asarray(cmap(tri_temp_norm)[:3]) * 255.0).astype(np.uint8)
+                    fill_px.append(px)
+                    fill_py.append(py)
+                    fill_vids.append([i0, i1, i2])
+                    fill_bary.append([w0, w1, w2])
 
-                    image[py, px] = color
+        if fill_px:
+            cache.mesh_px = np.asarray(fill_px, dtype=np.int32)
+            cache.mesh_py = np.asarray(fill_py, dtype=np.int32)
+            cache.mesh_vertex_ids = np.asarray(fill_vids, dtype=np.int32)
+            cache.mesh_bary = np.asarray(fill_bary, dtype=np.float64)
+
+        return cache
+
+    def _render_thermal_image(
+        self,
+        point_temperatures: np.ndarray,
+        mesh_vertex_temperatures: np.ndarray,
+        depth_map: np.ndarray,
+        cache: ThermalViewCache,
+    ) -> np.ndarray:
+        """
+        Render thermal image using a precomputed fixed-view cache.
+        Only temperature-dependent work happens here.
+        """
+        H, W = depth_map.shape
+
+        # CHANGED: use actual configured background, not implicit black-only logic
+        background = np.asarray(self.thermal_background, dtype=np.uint8)
+        image = np.zeros((H, W, 3), dtype=np.uint8)
+        image[:] = background
+
+        # ---------------------------------------------------
+        # Stage 1: sparse point splatting
+        # ---------------------------------------------------
+        if (
+            cache.point_px is not None
+            and cache.point_py is not None
+            and cache.point_depth is not None
+            and cache.point_linear_idx is not None
+            and len(cache.point_px) > 0
+        ):
+            point_colors = self._temperature_to_rgb(point_temperatures[cache.point_linear_idx])
+            z_buffer = np.full((H, W), np.inf, dtype=np.float64)
+            radius = max(0, self.thermal_point_size // 2)
+
+            if radius == 0:
+                for px, py, pz, color in zip(cache.point_px, cache.point_py, cache.point_depth, point_colors):
+                    md = depth_map[py, px]
+                    if not np.isfinite(md):
+                        continue
+                    if pz > md + self.thermal_depth_epsilon:
+                        continue
+                    if pz < z_buffer[py, px]:
+                        z_buffer[py, px] = pz
+                        image[py, px] = color
+            else:
+                for px, py, pz, color in zip(cache.point_px, cache.point_py, cache.point_depth, point_colors):
+                    for dx in range(-radius, radius + 1):
+                        for dy in range(-radius, radius + 1):
+                            xx = px + dx
+                            yy = py + dy
+                            if 0 <= xx < W and 0 <= yy < H:
+                                md = depth_map[yy, xx]
+                                if not np.isfinite(md):
+                                    continue
+                                if pz > md + self.thermal_depth_epsilon:
+                                    continue
+                                if pz < z_buffer[yy, xx]:
+                                    z_buffer[yy, xx] = pz
+                                    image[yy, xx] = color
+
+        # ---------------------------------------------------
+        # Stage 2: dense mesh fill
+        # ---------------------------------------------------
+        if (
+            cache.mesh_px is not None
+            and cache.mesh_py is not None
+            and cache.mesh_vertex_ids is not None
+            and cache.mesh_bary is not None
+            and len(cache.mesh_px) > 0
+        ):
+            tri_temps = np.sum(
+                mesh_vertex_temperatures[cache.mesh_vertex_ids] * cache.mesh_bary,
+                axis=1,
+            )
+            tri_colors = self._temperature_to_rgb(tri_temps)
+
+            # CHANGED: fill only background-colored pixels, not only hard-coded black pixels
+            empty_mask = np.all(image[cache.mesh_py, cache.mesh_px] == background, axis=1)
+            image[cache.mesh_py[empty_mask], cache.mesh_px[empty_mask]] = tri_colors[empty_mask]
 
         return image
 
@@ -629,25 +723,39 @@ class BlenderProcRenderer(RenderParams):
                 #     instances[instance == int(j)] = color
                 # Image.fromarray(instances).save(self.output_path / "instances" / f"{i:04d}.png")
 
-                if self.render_thermal and self.thermal_points_world is not None:
+                if (
+                    self.render_thermal
+                    and self.thermal_points_world is not None
+                    and self.thermal_values is not None
+                ):
                     cam2world = np.asarray(self.metadata["frames"][i]["camera_to_world"], dtype=np.float64)
                     K = np.asarray(self.metadata["frames"][i]["intrinsics"], dtype=np.float64)
 
-                    for j in range(0, self.thermal_values.shape[1], 2):
-                        self.mesh_vertex_temperatures = self._transfer_temperature_to_mesh_vertices(
-                            self.mesh_vertices_world,
-                            self.thermal_points_world,
-                            self.thermal_values[:, j],
-                            k=self.thermal_k_neighbors,
-                        )
-                        thermal = self._render_thermal_image(
-                            points_world=self.thermal_points_world,
-                            temperatures=self.thermal_values[:, j],
+                    if i not in self.thermal_render_cache:
+                        self.thermal_render_cache[i] = self._build_thermal_render_cache(
                             cam2world=cam2world,
                             K=K,
                             depth_map=depth,
                         )
-                        Image.fromarray(thermal).save(self.output_path / "thermal" / f"{i:04d}_thermal_{j:04d}.png")
+
+                    cache = self.thermal_render_cache[i]
+
+                    for j in range(0, self.thermal_values.shape[1], 2):
+                        point_temperatures = self.thermal_values[:, j]
+
+                        # CHANGED: use helper method for consistency and readability
+                        mesh_vertex_temperatures = self._compute_mesh_vertex_temperatures(point_temperatures)
+
+                        thermal = self._render_thermal_image(
+                            point_temperatures=point_temperatures,
+                            mesh_vertex_temperatures=mesh_vertex_temperatures,
+                            depth_map=depth,
+                            cache=cache,
+                        )
+
+                        Image.fromarray(thermal).save(
+                            self.output_path / "thermal" / f"{i:04d}_thermal_{j:04d}.png"
+                        )
 
             (self.output_path / f"{i}.hdf5").unlink()
 
@@ -657,8 +765,17 @@ class BlenderProcRenderer(RenderParams):
 
     def run(self):
         poi = bproc.object.compute_poi(self.scene_objects)
-        for _ in range(self.num_frames):
-            self.generate_camera_pose(poi)
+
+        # CHANGED: guard against load_camera_path being None
+        if self.load_camera_path is not None and self.load_camera_path.exists():
+            with open(self.load_camera_path, "r") as f:
+                camera_data = json.load(f)
+            for frame in camera_data["frames"]:
+                cam2world = np.asarray(frame["camera_to_world"], dtype=np.float64)
+                self._add_camera_pose(cam2world)
+        else:
+            for _ in range(self.num_frames):
+                self.generate_camera_pose(poi)
 
         bproc.renderer.set_output_format(enable_transparency=self.enable_transparency)
         bproc.renderer.enable_depth_output(activate_antialiasing=False)
@@ -667,8 +784,8 @@ class BlenderProcRenderer(RenderParams):
 
         render_data = bproc.renderer.render()
         bproc.writer.write_hdf5(str(self.output_path), render_data)
-        self.save_images()
         self.save_metadata()
+        self.save_images()
 
 
 def main():
