@@ -43,6 +43,8 @@ class RenderParams:
     """Path to point-cloud temperature CSV with columns x,y,z,temperature"""
     render_thermal: bool = True
     """Render thermal image from point cloud"""
+    save_temp_maps: bool = True
+    """Save raw interpolated temperature maps as .npy files"""
     thermal_point_size: int = 2
     """Projected thermal point splat size in pixels"""
     thermal_cmap: str = "inferno"
@@ -51,11 +53,11 @@ class RenderParams:
     """Optional fixed minimum temperature"""
     thermal_max: Optional[float] = None
     """Optional fixed maximum temperature"""
-    thermal_depth_epsilon: float = 0.01
+    thermal_depth_epsilon: float = 0.005
     """Visibility tolerance when comparing thermal depth against mesh depth"""
     thermal_background: tuple[int, int, int] = (0, 0, 0)
     """RGB background color for thermal images"""
-    thermal_k_neighbors: int = 2
+    thermal_k_neighbors: int = 1
     """Number of nearest thermal points used for mesh vertex temperature interpolation"""
 
     # Coordinate convention for thermal CSV
@@ -491,10 +493,6 @@ class BlenderProcRenderer(RenderParams):
 
         cache = ThermalViewCache()
 
-        # CHANGED: explicit guard to keep type/None behavior sane
-        if self.thermal_points_world is None:
-            return cache
-
         # ---------------------------------------------------
         # Cache sparse thermal point projection / visibility
         # ---------------------------------------------------
@@ -624,11 +622,10 @@ class BlenderProcRenderer(RenderParams):
         Only temperature-dependent work happens here.
         """
         H, W = depth_map.shape
-
-        # CHANGED: use actual configured background, not implicit black-only logic
         background = np.asarray(self.thermal_background, dtype=np.uint8)
         image = np.zeros((H, W, 3), dtype=np.uint8)
         image[:] = background
+        temp_map = np.full((H, W), np.nan, dtype=np.float64)
 
         # ---------------------------------------------------
         # Stage 1: sparse point splatting
@@ -640,12 +637,13 @@ class BlenderProcRenderer(RenderParams):
             and cache.point_linear_idx is not None
             and len(cache.point_px) > 0
         ):
-            point_colors = self._temperature_to_rgb(point_temperatures[cache.point_linear_idx])
+            point_temps = point_temperatures[cache.point_linear_idx]
+            point_colors = self._temperature_to_rgb(point_temps)
             z_buffer = np.full((H, W), np.inf, dtype=np.float64)
             radius = max(0, self.thermal_point_size // 2)
 
             if radius == 0:
-                for px, py, pz, color in zip(cache.point_px, cache.point_py, cache.point_depth, point_colors):
+                for px, py, pz, color, temp in zip(cache.point_px, cache.point_py, cache.point_depth, point_colors, point_temps):
                     md = depth_map[py, px]
                     if not np.isfinite(md):
                         continue
@@ -654,8 +652,9 @@ class BlenderProcRenderer(RenderParams):
                     if pz < z_buffer[py, px]:
                         z_buffer[py, px] = pz
                         image[py, px] = color
+                        temp_map[py, px] = float(temp)
             else:
-                for px, py, pz, color in zip(cache.point_px, cache.point_py, cache.point_depth, point_colors):
+                for px, py, pz, color, temp in zip(cache.point_px, cache.point_py, cache.point_depth, point_colors, point_temps):
                     for dx in range(-radius, radius + 1):
                         for dy in range(-radius, radius + 1):
                             xx = px + dx
@@ -669,6 +668,7 @@ class BlenderProcRenderer(RenderParams):
                                 if pz < z_buffer[yy, xx]:
                                     z_buffer[yy, xx] = pz
                                     image[yy, xx] = color
+                                    temp_map[yy, xx] = float(temp)
 
         # ---------------------------------------------------
         # Stage 2: dense mesh fill
@@ -680,17 +680,15 @@ class BlenderProcRenderer(RenderParams):
             and cache.mesh_bary is not None
             and len(cache.mesh_px) > 0
         ):
-            tri_temps = np.sum(
-                mesh_vertex_temperatures[cache.mesh_vertex_ids] * cache.mesh_bary,
-                axis=1,
-            )
+            tri_temps = np.sum(mesh_vertex_temperatures[cache.mesh_vertex_ids] * cache.mesh_bary, axis=1)
             tri_colors = self._temperature_to_rgb(tri_temps)
 
             # CHANGED: fill only background-colored pixels, not only hard-coded black pixels
             empty_mask = np.all(image[cache.mesh_py, cache.mesh_px] == background, axis=1)
             image[cache.mesh_py[empty_mask], cache.mesh_px[empty_mask]] = tri_colors[empty_mask]
+            temp_map[cache.mesh_py[empty_mask], cache.mesh_px[empty_mask]] = tri_temps[empty_mask]
 
-        return image
+        return image, temp_map
 
     def save_images(self):
         for subdir in ["images", "normals", "depths", "semantics", "instances", "thermal"]:
@@ -739,23 +737,23 @@ class BlenderProcRenderer(RenderParams):
                         )
 
                     cache = self.thermal_render_cache[i]
-
+                    temp_maps = np.full((self.thermal_values.shape[1], depth.shape[0], depth.shape[1]), np.nan, dtype=np.float64)
                     for j in range(0, self.thermal_values.shape[1], 2):
                         point_temperatures = self.thermal_values[:, j]
 
-                        # CHANGED: use helper method for consistency and readability
                         mesh_vertex_temperatures = self._compute_mesh_vertex_temperatures(point_temperatures)
-
-                        thermal = self._render_thermal_image(
+                        thermal, temp_map = self._render_thermal_image(
                             point_temperatures=point_temperatures,
                             mesh_vertex_temperatures=mesh_vertex_temperatures,
                             depth_map=depth,
                             cache=cache,
                         )
+                        temp_maps[j] = temp_map
+                        
+                        Image.fromarray(thermal).save(self.output_path / "thermal" / f"{i:04d}_thermal_{j:04d}.png")
 
-                        Image.fromarray(thermal).save(
-                            self.output_path / "thermal" / f"{i:04d}_thermal_{j:04d}.png"
-                        )
+                    if self.save_temp_maps:
+                        np.save(self.output_path / f"{i:04d}_temp_map.npy", temp_maps)
 
             (self.output_path / f"{i}.hdf5").unlink()
 
@@ -766,7 +764,6 @@ class BlenderProcRenderer(RenderParams):
     def run(self):
         poi = bproc.object.compute_poi(self.scene_objects)
 
-        # CHANGED: guard against load_camera_path being None
         if self.load_camera_path is not None and self.load_camera_path.exists():
             with open(self.load_camera_path, "r") as f:
                 camera_data = json.load(f)
